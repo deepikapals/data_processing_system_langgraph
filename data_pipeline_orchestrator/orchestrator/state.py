@@ -45,6 +45,10 @@ class PipelineState(TypedDict, total=False):
     execution_memory: Optional[list[str]]
     summary: Optional[str]
 
+    # Long-term memory: dated one-line summaries of the last 10 runs, persisted
+    # to disk by run_summarizer_memorizer_agent.
+    long_term_memory: Optional[list[dict]]
+
     # Free-form list of human-readable log lines, appended to by each node.
     log: list[str]
 

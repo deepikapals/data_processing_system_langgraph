@@ -387,3 +387,86 @@ def test_api_invoker_retries_then_succeeds(monkeypatch):
     assert result["api_submit_ok"] is True
     assert result["job_id"] == "job-9"
     assert result["dag_monitor_ok"] is True
+
+
+def _happy_http(method, url, payload_obj=None, extra_headers=None):
+    if method == "POST" and url == "http://airflow.localhost:6563/auth/token":
+        return 200, {"access_token": "t"}
+    if method == "POST" and url == "http://localhost:8080/api/submitJob/":
+        return 200, {"jobId": "job-1", "status": "PENDING"}
+    if method == "GET" and url.rstrip("/") == "http://localhost:8080/api/jobStatus/job-1":
+        return 200, {"status": "SUCCESS"}
+    if method == "POST" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns":
+        return 200, {"dag_run_id": "manual__1", "state": "queued"}
+    if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/manual__1":
+        return 200, {"dag_run_id": "manual__1", "state": "success"}
+    raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+
+def test_long_term_memory_keeps_last_10_dated_summaries(monkeypatch, tmp_path):
+    ltm_file = tmp_path / "ltm.json"
+    monkeypatch.setenv("LONG_TERM_MEMORY_PATH", str(ltm_file))
+    monkeypatch.setattr(nodes, "_http_json_request", _happy_http)
+
+    for i in range(12):
+        result = run_pipeline(f"run-{i}")
+
+    ltm = result["long_term_memory"]
+    assert len(ltm) == 10                                  # trimmed
+    assert [e["input"] for e in ltm] == [f"run-{i}" for i in range(2, 12)]
+    assert all(e["outcome"] == "SUCCESS" for e in ltm)
+    assert all("T" in e["timestamp"] for e in ltm)         # ISO date+time
+    assert ltm[-1]["summary"].startswith("SUCCESS:")
+
+    import json
+    on_disk = json.loads(ltm_file.read_text())
+    assert len(on_disk) == 10
+    assert on_disk[-1]["input"] == "run-11"
+
+
+def test_long_term_memory_records_failed_run(monkeypatch, tmp_path):
+    monkeypatch.setenv("LONG_TERM_MEMORY_PATH", str(tmp_path / "ltm.json"))
+    monkeypatch.setattr(nodes.time, "sleep", lambda _: None)
+
+    def failing_http(method, url, payload_obj=None, extra_headers=None):
+        raise HTTPError(url=url, code=500, msg="x", hdrs=None, fp=None)
+
+    monkeypatch.setattr(nodes, "_http_json_request", failing_http)
+
+    result = run_pipeline("boom")
+
+    ltm = result["long_term_memory"]
+    assert len(ltm) == 1
+    assert ltm[0]["outcome"] == "FAILED"
+    assert "after 5 attempts" in ltm[0]["summary"]
+
+
+def test_data_pipeline_monitor_failed_status_routes_to_hil(monkeypatch):
+    calls = {"monitor_get": 0, "sleep": 0}
+
+    def fake_http_json_request(method, url, payload_obj=None, extra_headers=None):
+        if method == "POST" and url == "http://airflow.localhost:6563/auth/token":
+            return 200, {"access_token": "t"}
+        if method == "POST" and url == "http://localhost:8080/api/submitJob/":
+            return 200, {"jobId": "job-1", "status": "PENDING"}
+        if method == "GET" and url.rstrip("/") == "http://localhost:8080/api/jobStatus/job-1":
+            return 200, {"status": "SUCCESS"}
+        if method == "POST" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns":
+            return 200, {"dag_run_id": "manual__1", "state": "queued"}
+        if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/manual__1":
+            calls["monitor_get"] += 1
+            return 200, {"dag_run_id": "manual__1", "state": "failed"}
+        raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+    monkeypatch.setattr(nodes, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(nodes.time, "sleep", lambda _: calls.__setitem__("sleep", calls["sleep"] + 1))
+
+    result = run_pipeline("hello")
+
+    assert calls["monitor_get"] == 1          # terminal FAILED -> no polling loop
+    assert calls["sleep"] == 0
+    assert result["dag_monitor_ok"] is False
+    assert result["dag_monitor_status"] == "FAILED"
+    assert result["hil_required"] is True
+    assert "ended as FAILED" in result["error"]
+    assert any("hil_agent" in line for line in result["log"])

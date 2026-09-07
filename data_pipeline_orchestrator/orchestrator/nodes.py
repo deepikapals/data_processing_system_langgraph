@@ -16,12 +16,47 @@ import time
 import base64
 from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from orchestrator.state import PipelineState
+
+# Long-term memory: a rolling JSON list of the last N run summaries with
+# timestamps, persisted across process restarts.
+LONG_TERM_MEMORY_LIMIT = 10
+
+# Terminal DAG-run states that mean "stop polling, hand to a human".
+_DAG_TERMINAL_FAILURE_STATES = {"FAILED", "UPSTREAM_FAILED", "ERROR"}
+
+
+def _long_term_memory_path() -> Path:
+    configured = os.environ.get("LONG_TERM_MEMORY_PATH")
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parent.parent / "long_term_memory.json"
+
+
+def _load_long_term_memory() -> list[dict[str, Any]]:
+    try:
+        data = json.loads(_long_term_memory_path().read_text("utf-8"))
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _append_long_term_memory(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Append `entry`, keep only the last LONG_TERM_MEMORY_LIMIT, persist, return the list."""
+    history = _load_long_term_memory()
+    history.append(entry)
+    history = history[-LONG_TERM_MEMORY_LIMIT:]
+    try:
+        _long_term_memory_path().write_text(json.dumps(history, indent=2), "utf-8")
+    except OSError:
+        pass  # best-effort; a run must not fail because memory could not be written
+    return history
 
 
 def _emit_status(state: PipelineState, message: str) -> None:
@@ -555,6 +590,23 @@ def data_pipeline_monitor_agent(state: PipelineState) -> dict[str, Any]:
                         "log": log,
                     }
 
+                if normalized_status in _DAG_TERMINAL_FAILURE_STATES:
+                    log.append(
+                        f"data_pipeline_monitor_agent: DAG run reported {normalized_status}, routing to HIL"
+                    )
+                    _emit_status(
+                        state,
+                        f"data_pipeline_monitor_agent DAG reported {normalized_status}, routing to HIL",
+                    )
+                    return {
+                        "dag_monitor_ok": False,
+                        "dag_monitor_status": normalized_status,
+                        "dag_monitor_status_code": status_code,
+                        "dag_run_id": dag_run_id,
+                        "error": f"DAG {dag_name} run {dag_run_id} ended as {normalized_status}",
+                        "log": log,
+                    }
+
                 break
             except HTTPError as exc:
                 last_http_error = exc
@@ -697,9 +749,24 @@ def run_summarizer_memorizer_agent(state: PipelineState) -> dict[str, Any]:
     summary = _build_execution_summary(state, execution_memory)
     log.append("run_summarizer_memorizer_agent: summary generated")
 
+    # Long-term memory: a one-line summary of this run, dated, kept for 10 runs.
+    outcome = "FAILED" if state.get("error") else "SUCCESS"
+    note = state.get("error") or state.get("hil_message") or f"final output {data!r}"
+    entry = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "input": data,
+        "outcome": outcome,
+        "summary": f"{outcome}: {str(note)[:200]}",
+    }
+    long_term_memory = _append_long_term_memory(entry)
+    log.append(
+        f"run_summarizer_memorizer_agent: long-term memory updated ({len(long_term_memory)} runs)"
+    )
+
     return {
         "final_output": data,
         "execution_memory": execution_memory,
         "summary": summary,
+        "long_term_memory": long_term_memory,
         "log": log,
     }

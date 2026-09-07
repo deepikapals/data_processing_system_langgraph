@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+long_term_memory.json

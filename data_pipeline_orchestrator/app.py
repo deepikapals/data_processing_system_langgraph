@@ -17,7 +17,13 @@ import time
 import streamlit as st
 
 from orchestrator.graph import stream_pipeline
-from orchestrator.nodes import _build_execution_summary
+from datetime import datetime
+
+from orchestrator.nodes import (
+    _append_long_term_memory,
+    _build_execution_summary,
+    _load_long_term_memory,
+)
 
 st.set_page_config(page_title="Data Pipeline Orchestrator", page_icon="🛠️")
 
@@ -133,11 +139,21 @@ def _run_graph_thread(text: str, q: "queue.Queue", stop_event: threading.Event) 
     if "summary" not in result:  # summarizer node did not get to run — run it here
         memory = list(result.get("log", []))
         summary = _build_execution_summary(result, memory)
+        outcome = "FAILED" if result.get("error") else "SUCCESS"
+        ltm = _append_long_term_memory(
+            {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "input": result.get("input"),
+                "outcome": outcome,
+                "summary": f"{outcome}: {str(result.get('error') or result.get('input'))[:200]}",
+            }
+        )
         result.update(
             {
                 "final_output": result.get("input"),
                 "execution_memory": memory,
                 "summary": summary,
+                "long_term_memory": ltm,
                 "log": memory + ["run_summarizer_memorizer_agent: summary generated (forced)"],
             }
         )
@@ -160,6 +176,27 @@ def _draw_graph(statuses: dict, note: str) -> None:
         or "_waiting…_"
     )
 
+
+def _render_history() -> None:
+    """Historical Job Run Summary — long-term memory, newest first."""
+    history = st.session_state.get("result", {}).get("long_term_memory") if st.session_state.get("result") else None
+    history = history or _load_long_term_memory()
+    st.sidebar.header("Historical Job Run Summary")
+    if not history:
+        st.sidebar.caption("No past runs yet.")
+        return
+    st.sidebar.caption(f"Last {len(history)} runs")
+    for e in reversed(history):
+        badge = "🟩" if e.get("outcome") == "SUCCESS" else "🟥"
+        st.sidebar.markdown(
+            f"{badge} **{e.get('timestamp')}**  \n"
+            f"input: `{e.get('input')}`  \n"
+            f"{html.escape(str(e.get('summary', '')))}"
+        )
+        st.sidebar.divider()
+
+
+_render_history()
 
 input_data = st.text_input("Pipeline input", placeholder="Enter input value…")
 run = st.button("Run datapipeline job", type="primary")
