@@ -15,6 +15,28 @@ It ships with three front ends:
 
 ---
 
+## Tech stack
+
+| Layer | Technology | Notes |
+|-------|-----------|-------|
+| Language | **Python 3.9+** | type hints, `from __future__ import annotations` |
+| Orchestration | **LangGraph** (`langgraph>=0.2`) | `StateGraph` with conditional edges; `.invoke()` and `.stream(stream_mode="updates")` |
+| State schema | **`typing.TypedDict`** (`PipelineState`, `total=False`) | nodes return partial updates that LangGraph merges |
+| LLM plumbing (optional) | **LangChain** (`langchain-core`), **`langchain-openai`** | only used if a node calls `get_llm()`; unused by the default flow |
+| HTTP client | **`urllib.request`** (stdlib) | no `requests`/`httpx`; JSON in/out, 5 s timeout, Basic/Bearer auth |
+| External APIs | **submitJob REST API**, **Apache Airflow REST API** (`/api/v2` DAG runs, `/auth/token`) | see [Configuration](#configuration) |
+| CLI | **`argparse`** + a small regex command parser | one‑shot and interactive/REPL modes |
+| Web UI | **Streamlit** (`streamlit>=1.30`) | `st.graphviz_chart` renders the live graph from a DOT string (no `graphviz` package needed) |
+| Concurrency (UI) | **`threading`** + **`queue.Queue`** | graph runs on a worker thread so the Stop button stays responsive |
+| Config | **`python-dotenv`** | `.env` loaded by `main.py`; everything else via env vars |
+| Persistence | **local JSON file** (`long_term_memory.json`) | rolling last‑10‑runs long‑term memory; no database |
+| Tests | **pytest** | `_http_json_request` monkey‑patched; no network in the mocked tests |
+
+No database, message broker, or container runtime is required — the orchestrator
+is a single Python process that talks to the two REST APIs over HTTP.
+
+---
+
 ## What it does
 
 Given an input string, the orchestrator runs this sequence:
