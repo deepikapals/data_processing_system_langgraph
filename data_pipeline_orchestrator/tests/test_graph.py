@@ -11,13 +11,13 @@ def test_pipeline_runs_end_to_end():
     result = run_pipeline("hello")
 
     assert result["final_output"] == "hello"
-    assert result["step1_output"] == "hello"
-    assert result["step2_output"] == "hello"
-    assert result["step3_output"] == "hello"
-    assert len(result["log"]) >= 5
-    assert "step1_ingest" in result["log"][0]
-    assert any("api_invoker_agent" in line for line in result["log"])
-    assert "step4_finalize" in result["log"][-1]
+    assert len(result["log"]) >= 3
+    assert "api_invoker_agent" in result["log"][0]
+    assert "run_summarizer_memorizer_agent" in result["log"][-1]
+    # run_summarizer_memorizer_agent keeps a short-term memory + writes a human-readable summary.
+    assert result["execution_memory"] == result["log"][: len(result["execution_memory"])]
+    assert "'hello'" in result["summary"]
+    assert "Outcome:" in result["summary"]
 
 
 def test_calls_api_status_validator_after_submit_200(monkeypatch):
@@ -53,6 +53,10 @@ def test_calls_api_status_validator_after_submit_200(monkeypatch):
     assert any("api_status_validator_agent" in line for line in result["log"])
     assert any("data_pipeline_invoker_agent" in line for line in result["log"])
     assert any("data_pipeline_monitor_agent" in line for line in result["log"])
+    assert "Outcome: SUCCESS" in result["summary"]
+    assert "submitJob accepted the job (HTTP 200)" in result["summary"]
+    assert "DAG monitoring finished as SUCCESS" in result["summary"]
+    assert result["execution_memory"] and "summary generated" not in "\n".join(result["execution_memory"])
 
 
 def test_status_validator_polls_until_success(monkeypatch):
@@ -260,9 +264,9 @@ def test_dag_invoker_falls_back_to_experimental_trigger(monkeypatch):
         if method == "POST" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/":
             raise HTTPError(url=url, code=405, msg="Method Not Allowed", hdrs=None, fp=None)
         if method == "POST" and url == "http://airflow.localhost:6563/api/experimental/dags/random_number_check_dag/dag_runs":
-            return 200, {"message": "Created"}
-        if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns":
-            return 200, {"dag_runs": [{"dag_run_id": "manual__1", "state": "success"}]}
+            return 200, {"message": "Created", "run_id": "manual__1"}
+        if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/manual__1":
+            return 200, {"dag_run_id": "manual__1", "state": "success"}
         raise AssertionError(f"Unexpected HTTP call: {method} {url}")
 
     monkeypatch.setattr(nodes, "_http_json_request", fake_http_json_request)
@@ -298,4 +302,88 @@ def test_dag_invoker_retries_payload_on_422_and_succeeds(monkeypatch):
 
     assert attempts["dag_post"] == 2
     assert result["dag_invocation_ok"] is True
+    assert result["dag_monitor_ok"] is True
+
+
+def test_data_pipeline_monitor_gives_up_after_max_retries(monkeypatch):
+    calls = {"monitor_get": 0, "sleep": 0}
+
+    def fake_http_json_request(method: str, url: str, payload_obj=None, extra_headers=None):
+        if method == "POST" and url == "http://airflow.localhost:6563/auth/token":
+            return 200, {"access_token": "token-123"}
+        if method == "POST" and url == "http://localhost:8080/api/submitJob/":
+            return 200, {"jobId": "job-123", "status": "PENDING"}
+        if method == "GET" and url.rstrip("/") == "http://localhost:8080/api/jobStatus/job-123":
+            return 200, {"status": "SUCCESS"}
+        if method == "POST" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns":
+            return 200, {"dag_run_id": "manual__1", "state": "queued"}
+        if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/manual__1":
+            calls["monitor_get"] += 1
+            return 200, {"dag_run_id": "manual__1", "state": "running"}  # never SUCCESS
+        raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+    monkeypatch.setattr(nodes, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(nodes.time, "sleep", lambda _: calls.__setitem__("sleep", calls["sleep"] + 1))
+
+    result = run_pipeline("hello")
+
+    assert calls["monitor_get"] == 5           # capped at DAG_MONITOR_MAX_RETRIES
+    assert calls["sleep"] == 4                  # no sleep after the final attempt
+    assert result["dag_monitor_ok"] is False
+    assert "after 5 attempts" in result["error"]
+    assert result["hil_required"] is True       # routed to hil_agent
+
+
+def test_api_invoker_retries_5_times_then_gives_up(monkeypatch):
+    calls = {"submit": 0, "sleep": 0}
+
+    def fake_http_json_request(method: str, url: str, payload_obj=None, extra_headers=None):
+        if method == "POST" and "submitJob" in url:
+            calls["submit"] += 1
+            raise HTTPError(url=url, code=500, msg="Server Error", hdrs=None, fp=None)
+        raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+    def fake_sleep(seconds):
+        assert seconds == 20
+        calls["sleep"] += 1
+
+    monkeypatch.setattr(nodes, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(nodes.time, "sleep", fake_sleep)
+
+    result = run_pipeline("hello")
+
+    assert calls["submit"] == 5          # one POST per attempt (500 breaks the url loop)
+    assert calls["sleep"] == 4           # 20s wait between attempts, none after the last
+    assert result["api_submit_ok"] is False
+    assert "after 5 attempts" in result["error"]
+
+
+def test_api_invoker_retries_then_succeeds(monkeypatch):
+    calls = {"submit": 0, "sleep": 0}
+
+    def fake_http_json_request(method: str, url: str, payload_obj=None, extra_headers=None):
+        if method == "POST" and url == "http://localhost:8080/api/submitJob/":
+            calls["submit"] += 1
+            if calls["submit"] < 3:
+                raise HTTPError(url=url, code=503, msg="Unavailable", hdrs=None, fp=None)
+            return 200, {"jobId": "job-9", "status": "PENDING"}
+        if method == "POST" and url == "http://airflow.localhost:6563/auth/token":
+            return 200, {"access_token": "t"}
+        if method == "GET" and url.rstrip("/") == "http://localhost:8080/api/jobStatus/job-9":
+            return 200, {"status": "SUCCESS"}
+        if method == "POST" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns":
+            return 200, {"dag_run_id": "manual__1", "state": "queued"}
+        if method == "GET" and url == "http://airflow.localhost:6563/api/v2/dags/random_number_check_dag/dagRuns/manual__1":
+            return 200, {"dag_run_id": "manual__1", "state": "success"}
+        raise AssertionError(f"Unexpected HTTP call: {method} {url}")
+
+    monkeypatch.setattr(nodes, "_http_json_request", fake_http_json_request)
+    monkeypatch.setattr(nodes.time, "sleep", lambda _: calls.__setitem__("sleep", calls["sleep"] + 1))
+
+    result = run_pipeline("hello")
+
+    assert calls["submit"] == 3
+    assert calls["sleep"] == 2
+    assert result["api_submit_ok"] is True
+    assert result["job_id"] == "job-9"
     assert result["dag_monitor_ok"] is True

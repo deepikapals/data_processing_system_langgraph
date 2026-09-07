@@ -15,11 +15,6 @@ class PipelineState(TypedDict, total=False):
     # Original input handed to the pipeline when it starts.
     input: Any
 
-    # Output produced by each step, kept around for debugging/inspection.
-    step1_output: Optional[Any]
-    step2_output: Optional[Any]
-    step3_output: Optional[Any]
-
     # API orchestration details.
     api_submit_ok: Optional[bool]
     api_submit_status_code: Optional[int]
@@ -44,6 +39,11 @@ class PipelineState(TypedDict, total=False):
 
     # Final result once the pipeline has finished.
     final_output: Optional[Any]
+
+    # Short-term memory of the run (log snapshot) + human-readable summary,
+    # both produced by run_summarizer_memorizer_agent.
+    execution_memory: Optional[list[str]]
+    summary: Optional[str]
 
     # Free-form list of human-readable log lines, appended to by each node.
     log: list[str]

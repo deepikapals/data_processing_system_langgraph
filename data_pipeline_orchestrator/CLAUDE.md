@@ -14,13 +14,15 @@ This file gives Claude Code the minimum project context needed to be effective i
 
 - State schema lives in `orchestrator/state.py` as `PipelineState` (TypedDict).
 - Pipeline nodes live in `orchestrator/nodes.py`:
-  - `step1_ingest`
-  - `step2_process`
-  - `step3_validate`
-  - `step4_finalize`
+  - `api_invoker_agent`
+  - `api_status_validator_agent`
+  - `data_pipeline_invoker_agent`
+  - `data_pipeline_monitor_agent`
+  - `hil_agent`
+  - `run_summarizer_memorizer_agent`
 - Graph wiring lives in `orchestrator/graph.py`.
-- Current flow is linear:
-  - START -> step1_ingest -> step2_process -> step3_validate -> step4_finalize -> END
+- Flow:
+  - START -> api_invoker_agent -> (status/DAG agents, hil_agent on failure) -> run_summarizer_memorizer_agent -> END
 
 ## Local Setup
 

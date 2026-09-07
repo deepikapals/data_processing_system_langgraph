@@ -48,36 +48,6 @@ def get_llm():
     )
 
 
-def step1_ingest(state: PipelineState) -> dict[str, Any]:
-    """Placeholder: take the raw input and normalize/validate it."""
-    raw = state.get("input")
-    log = list(state.get("log", []))
-    log.append(f"step1_ingest: received input={raw!r}")
-
-    # TODO: replace with real ingestion logic (e.g. load a file, hit an API).
-    output = raw
-
-    return {"step1_output": output, "log": log}
-
-
-def step2_process(state: PipelineState) -> dict[str, Any]:
-    """Placeholder: transform the ingested data."""
-    data = state.get("step1_output")
-    log = list(state.get("log", []))
-    log.append(f"step2_process: processing {data!r}")
-
-    # Example of how you'd swap this for a real LLM call:
-    #
-    #   llm = get_llm()
-    #   response = llm.invoke(f"Summarize this: {data}")
-    #   output = response.content
-    #
-    # For the scaffold we just pass the data through unchanged.
-    output = data
-
-    return {"step2_output": output, "log": log}
-
-
 def _http_json_request(
     method: str,
     url: str,
@@ -182,25 +152,20 @@ def _dag_trigger_urls(dag_name: str) -> list[str]:
 
 
 def _dag_status_urls(dag_name: str, dag_run_id: str | None) -> list[str]:
-    """Build DAG status URL candidates for Airflow REST API endpoints."""
+    """Single DAG status URL: GET {base}/dags/{dag_name}/dagRuns/{dag_run_id}.
+
+    `dag_run_id` comes from data_pipeline_invoker_agent. Returns an empty list
+    when it is missing so the monitor fails fast instead of guessing.
+    """
     configured = os.environ.get("DAGS_STATUS_URL_TEMPLATE")
     if configured:
         return [configured.format(dag_name=dag_name, dag_run_id=dag_run_id or "")]
 
-    base = _airflow_api_base_url()
-    split = urlsplit(base)
-    origin = f"{split.scheme}://{split.netloc}"
-    if dag_run_id:
-        return [
-            f"{base}/dags/{dag_name}/dagRuns/{dag_run_id}",
-            f"{base}/dags/{dag_name}/dagRuns",
-            f"{origin}/api/experimental/dags/{dag_name}/dag_runs/{dag_run_id}",
-            f"{origin}/api/experimental/dags/{dag_name}/dag_runs",
-        ]
-    return [
-        f"{base}/dags/{dag_name}/dagRuns",
-        f"{origin}/api/experimental/dags/{dag_name}/dag_runs",
-    ]
+    if not dag_run_id:
+        return []
+
+    base = _airflow_api_base_url()  # default http://airflow.localhost:6563/api/v2
+    return [f"{base}/dags/{dag_name}/dagRuns/{dag_run_id}"]
 
 
 def _airflow_token_url() -> str:
@@ -276,52 +241,70 @@ def _resolve_airflow_bearer_token(state: PipelineState, log: list[str]) -> str |
 
 
 def api_invoker_agent(state: PipelineState) -> dict[str, Any]:
-    """Call submitJob API and persist status/job metadata in state."""
+    """Call submitJob API and persist status/job metadata in state.
+
+    Retries the whole call up to API_INVOKER_MAX_RETRIES times (default 5),
+    waiting API_INVOKER_RETRY_DELAY seconds (default 20) between attempts,
+    until submitJob returns HTTP 200.
+    """
     submit_urls = _submit_job_urls()
     log = list(state.get("log", []))
-    last_http_error: HTTPError | None = None
-    last_other_error: Exception | None = None
+    max_retries = int(os.environ.get("API_INVOKER_MAX_RETRIES", "5"))
+    retry_delay = int(os.environ.get("API_INVOKER_RETRY_DELAY", "20"))
 
-    for submit_url in submit_urls:
-        log.append(f"api_invoker_agent: calling POST {submit_url}")
-        _emit_status(state, f"api_invoker_agent calling POST {submit_url}")
-        try:
-            status_code, payload = _http_json_request("POST", submit_url)
-            job_id = payload.get("jobId")
-            job_submit_status = payload.get("status")
+    for attempt in range(1, max_retries + 1):
+        last_http_error: HTTPError | None = None
+        last_other_error: Exception | None = None
 
-            log.append(f"api_invoker_agent: status_code={status_code}, job_id={job_id!r}")
-            _emit_status(state, f"api_invoker_agent received HTTP {status_code}; job_id={job_id}")
-            return {
-                "api_submit_ok": status_code == 200,
-                "api_submit_status_code": status_code,
-                "job_id": job_id,
-                "job_submit_status": job_submit_status,
-                "log": log,
-            }
-        except HTTPError as exc:
-            last_http_error = exc
-            log.append(f"api_invoker_agent: HTTPError status_code={exc.code} at {submit_url}")
-            _emit_status(state, f"api_invoker_agent received HTTP {exc.code} at {submit_url}")
-            if exc.code not in (404, 405):
+        for submit_url in submit_urls:
+            log.append(f"api_invoker_agent: calling POST {submit_url} (attempt {attempt}/{max_retries})")
+            _emit_status(state, f"api_invoker_agent calling POST {submit_url} (attempt {attempt}/{max_retries})")
+            try:
+                status_code, payload = _http_json_request("POST", submit_url)
+                job_id = payload.get("jobId")
+                job_submit_status = payload.get("status")
+
+                log.append(f"api_invoker_agent: status_code={status_code}, job_id={job_id!r}")
+                _emit_status(state, f"api_invoker_agent received HTTP {status_code}; job_id={job_id}")
+                if status_code == 200:
+                    return {
+                        "api_submit_ok": True,
+                        "api_submit_status_code": status_code,
+                        "job_id": job_id,
+                        "job_submit_status": job_submit_status,
+                        "log": log,
+                    }
+                last_http_error = None
+                last_other_error = RuntimeError(f"submitJob returned HTTP {status_code}")
                 break
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_other_error = exc
-            log.append(f"api_invoker_agent: request failed at {submit_url}: {exc}")
-            _emit_status(state, f"api_invoker_agent request failed at {submit_url}: {exc}")
-            break
+            except HTTPError as exc:
+                last_http_error = exc
+                log.append(f"api_invoker_agent: HTTPError status_code={exc.code} at {submit_url}")
+                _emit_status(state, f"api_invoker_agent received HTTP {exc.code} at {submit_url}")
+                if exc.code not in (404, 405):
+                    break
+            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_other_error = exc
+                log.append(f"api_invoker_agent: request failed at {submit_url}: {exc}")
+                _emit_status(state, f"api_invoker_agent request failed at {submit_url}: {exc}")
+                break
+
+        if attempt < max_retries:
+            log.append(f"api_invoker_agent: submitJob failed, retrying in {retry_delay} seconds")
+            _emit_status(state, f"api_invoker_agent submitJob failed, retrying in {retry_delay} seconds")
+            time.sleep(retry_delay)
 
     if last_http_error is not None:
         return {
             "api_submit_ok": False,
             "api_submit_status_code": last_http_error.code,
-            "error": f"submitJob API failed with HTTP {last_http_error.code}",
+            "error": f"submitJob API failed with HTTP {last_http_error.code} after {max_retries} attempts",
             "log": log,
         }
 
     return {
         "api_submit_ok": False,
-        "error": f"submitJob API request failed: {last_other_error}",
+        "error": f"submitJob API request failed after {max_retries} attempts: {last_other_error}",
         "log": log,
     }
 
@@ -499,15 +482,30 @@ def data_pipeline_invoker_agent(state: PipelineState) -> dict[str, Any]:
 
 
 def data_pipeline_monitor_agent(state: PipelineState) -> dict[str, Any]:
-    """Poll the DAG status every minute until it reports SUCCESS."""
+    """Poll the DAG status every minute until it reports SUCCESS.
+
+    Gives up after DAG_MONITOR_MAX_RETRIES attempts (default 5) and returns a
+    non-OK result, which routes the graph to hil_agent.
+    """
     log = list(state.get("log", []))
     dag_name = state.get("dag_name") or "random_number_check_dag"
     dag_run_id = state.get("dag_run_id")
     airflow_bearer_token = state.get("airflow_bearer_token")
     auth_headers = {"Authorization": f"Bearer {airflow_bearer_token}"} if airflow_bearer_token else None
     status_urls = _dag_status_urls(dag_name, dag_run_id)
+    if not status_urls:
+        log.append("data_pipeline_monitor_agent: no dag_run_id from data_pipeline_invoker_agent")
+        _emit_status(state, "data_pipeline_monitor_agent missing dag_run_id, routing to HIL")
+        return {
+            "dag_monitor_ok": False,
+            "error": "DAG monitoring skipped: no dag_run_id from data_pipeline_invoker_agent",
+            "log": log,
+        }
+    max_retries = int(os.environ.get("DAG_MONITOR_MAX_RETRIES", "5"))
+    attempt = 0
 
     while True:
+        attempt += 1
         last_http_error: HTTPError | None = None
         observed_status: str | None = None
 
@@ -582,6 +580,21 @@ def data_pipeline_monitor_agent(state: PipelineState) -> dict[str, Any]:
             log.append("data_pipeline_monitor_agent: all status URLs returned 404, retrying in 60 seconds")
             _emit_status(state, "data_pipeline_monitor_agent all status URLs returned 404, retrying")
 
+        if attempt >= max_retries:
+            log.append(
+                f"data_pipeline_monitor_agent: gave up after {attempt} attempts without SUCCESS"
+            )
+            _emit_status(
+                state, f"data_pipeline_monitor_agent gave up after {attempt} attempts, routing to HIL"
+            )
+            return {
+                "dag_monitor_ok": False,
+                "dag_monitor_status": str(observed_status).upper() if observed_status else None,
+                "dag_monitor_status_code": last_http_error.code if last_http_error else None,
+                "error": f"DAG monitoring did not reach SUCCESS after {attempt} attempts",
+                "log": log,
+            }
+
         log.append("data_pipeline_monitor_agent: status not SUCCESS, waiting 60 seconds before retry")
         _emit_status(state, "data_pipeline_monitor_agent status not SUCCESS, waiting 60 seconds")
         time.sleep(60)
@@ -622,22 +635,71 @@ def hil_agent(state: PipelineState) -> dict[str, Any]:
     }
 
 
-def step3_validate(state: PipelineState) -> dict[str, Any]:
-    """Placeholder: validate the processed data before final output."""
-    data = state.get("step2_output")
+def _build_execution_summary(state: PipelineState, memory: list[str]) -> str:
+    """Turn the run's state + log into a short human-readable summary."""
+    lines: list[str] = []
+    lines.append(f'Pipeline run for input {state.get("input")!r}.')
+
+    submit_code = state.get("api_submit_status_code")
+    if state.get("api_submit_ok"):
+        lines.append(
+            f"- submitJob accepted the job (HTTP {submit_code}); "
+            f"job_id={state.get('job_id')}, status={state.get('job_submit_status')}."
+        )
+    elif submit_code is not None or "api_invoker_agent" in " ".join(memory):
+        lines.append(f"- submitJob did not succeed (HTTP {submit_code}).")
+
+    if state.get("api_status_ok"):
+        lines.append(f"- Job status polling reached {state.get('api_job_status')}.")
+    elif state.get("job_id") and state.get("api_status_ok") is False:
+        lines.append("- Job status polling did not reach SUCCESS.")
+
+    if state.get("data_pipeline_invoked"):
+        if state.get("dag_invocation_ok"):
+            lines.append(
+                f"- DAG {state.get('dag_name')} triggered "
+                f"(HTTP {state.get('dag_invocation_status_code')}); "
+                f"dag_run_id={state.get('dag_run_id')}."
+            )
+        else:
+            lines.append(
+                f"- DAG {state.get('dag_name')} trigger failed "
+                f"(HTTP {state.get('dag_invocation_status_code')})."
+            )
+
+    if state.get("dag_monitor_ok"):
+        lines.append(f"- DAG monitoring finished as {state.get('dag_monitor_status')}.")
+    elif state.get("dag_monitor_ok") is False:
+        lines.append("- DAG monitoring did not reach SUCCESS.")
+
+    if state.get("hil_required"):
+        lines.append(f"- HUMAN-IN-THE-LOOP required: {state.get('hil_message')}")
+
+    if state.get("error"):
+        lines.append(f"- Ended with an error: {state.get('error')}")
+        lines.append("Outcome: FAILED — see the error above and the log for details.")
+    else:
+        lines.append(f"Outcome: SUCCESS — final output is {state.get('input')!r}.")
+
+    lines.append(f"({len(memory)} steps recorded in execution memory.)")
+    return "\n".join(lines)
+
+
+def run_summarizer_memorizer_agent(state: PipelineState) -> dict[str, Any]:
+    """Assemble the final output, keep a short-term memory of the run, and
+    write a human-readable summary of what happened."""
+    data = state.get("input")
     log = list(state.get("log", []))
-    log.append(f"step3_validate: validating {data!r}")
+    log.append(f"run_summarizer_memorizer_agent: finalizing {data!r}")
 
-    # TODO: replace with real validation logic; set state["error"] on failure.
-    output = data
+    # Short-term memory: a snapshot of every log line the graph produced.
+    execution_memory = list(log)
+    summary = _build_execution_summary(state, execution_memory)
+    log.append("run_summarizer_memorizer_agent: summary generated")
 
-    return {"step3_output": output, "log": log}
-
-
-def step4_finalize(state: PipelineState) -> dict[str, Any]:
-    """Placeholder: assemble the final output of the pipeline."""
-    data = state.get("step3_output")
-    log = list(state.get("log", []))
-    log.append(f"step4_finalize: finalizing {data!r}")
-
-    return {"final_output": data, "log": log}
+    return {
+        "final_output": data,
+        "execution_memory": execution_memory,
+        "summary": summary,
+        "log": log,
+    }

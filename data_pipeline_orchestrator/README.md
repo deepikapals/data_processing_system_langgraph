@@ -11,8 +11,8 @@ are placeholders for you to replace with real logic.
 ├── main.py                  # entry point: builds the graph, runs it, prints results
 ├── orchestrator/
 │   ├── state.py              # PipelineState: the shared state passed between nodes
-│   ├── nodes.py               # the 4 step functions (ingest, process, validate, finalize)
-│   └── graph.py                # wires the nodes into a StateGraph: step1 -> step2 -> step3 -> step4
+│   ├── nodes.py               # agent node functions (api invoke/status, DAG invoke/monitor, HIL, summarizer)
+│   └── graph.py                # wires the nodes into a StateGraph: api_invoker_agent -> ... -> run_summarizer_memorizer_agent
 ├── tests/
 │   └── test_graph.py           # smoke test that runs the graph end-to-end
 ├── requirements.txt
